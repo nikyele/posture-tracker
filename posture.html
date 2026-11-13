@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Posture Tracker with Persistent Alert</title>
+<style>
+  body { 
+    margin: 0; 
+    font-family: Arial, sans-serif; 
+    background: #f0f2f5; 
+    text-align: center;
+  }
+  #container {
+    display: inline-block;
+    position: relative;
+  }
+  video, canvas { 
+    border-radius: 12px; 
+    margin-top: 10px; 
+    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  }
+  #alertOverlay {
+    position: absolute;
+    top:0; left:0;
+    width: 100%; height:100%;
+    background: rgba(255,0,0,0.3);
+    display: none;
+    border-radius: 12px;
+  }
+  #controls { 
+    margin: 10px; 
+  }
+  button, select { 
+    padding: 6px 12px; 
+    margin: 2px; 
+    font-size: 12px; 
+    cursor: pointer; 
+    border-radius: 6px;
+    border: 1px solid #ccc;
+  }
+  #alertText {
+    font-size: 18px; 
+    color: red; 
+    font-weight: bold; 
+    margin-top: 5px;
+  }
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+</head>
+<body>
+
+<h2>Posture Tracker</h2>
+
+<div id="container">
+  <video id="video" width="320" height="240" autoplay muted playsinline></video>
+  <canvas id="output" width="320" height="240"></canvas>
+  <div id="alertOverlay"></div>
+</div>
+
+<div id="controls">
+  <button id="calibrate">Calibrate Baseline</button>
+  <button id="reset">Reset Baseline</button>
+  <br>
+  <label for="soundSelect">Alert Sound:</label>
+  <select id="soundSelect">
+    <option value="ping">Ping</option>
+    <option value="click">Click</option>
+    <option value="pop">Pop</option>
+    <option value="tick">Tick</option>
+    <option value="beep">Beep</option>
+    <option value="chime">Chime</option>
+    <option value="blip">Blip</option>
+    <option value="snap">Snap</option>
+    <option value="ding">Ding</option>
+    <option value="twang">Twang</option>
+  </select>
+</div>
+
+<p>Roll: <span id="roll">—</span>° | Pitch: <span id="pitch">—</span>°</p>
+<div id="alertText"></div>
+
+<script>
+const video = document.getElementById('video');
+const canvas = document.getElementById('output');
+const ctx = canvas.getContext('2d');
+const rollDisplay = document.getElementById('roll');
+const pitchDisplay = document.getElementById('pitch');
+const alertText = document.getElementById('alertText');
+const alertOverlay = document.getElementById('alertOverlay');
+const soundSelect = document.getElementById('soundSelect');
+
+let baselineRoll = null;
+let baselinePitch = null;
+const rollThreshold = 12;   // slightly less sensitive
+const pitchThreshold = 18;
+const pitchBuffer = [];
+const bufferSize = 5;
+
+const badPostureDelay = 3000; // 3 seconds
+let badPostureStart = null;
+
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+// --- Sound function ---
+function playSound(type){
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  gain.gain.setValueAtTime(0.5, audioCtx.currentTime);
+
+  switch(type){
+    case "ping": osc.type='triangle'; osc.frequency.setValueAtTime(1000,audioCtx.currentTime); break;
+    case "click": osc.type='square'; osc.frequency.setValueAtTime(800,audioCtx.currentTime); break;
+    case "pop": osc.type='sawtooth'; osc.frequency.setValueAtTime(600,audioCtx.currentTime); break;
+    case "tick": osc.type='square'; osc.frequency.setValueAtTime(1200,audioCtx.currentTime); break;
+    case "beep": osc.type='sine'; osc.frequency.setValueAtTime(900,audioCtx.currentTime); break;
+    case "chime": osc.type='triangle'; osc.frequency.setValueAtTime(1300,audioCtx.currentTime); break;
+    case "blip": osc.type='triangle'; osc.frequency.setValueAtTime(1100,audioCtx.currentTime); break;
+    case "snap": osc.type='square'; osc.frequency.setValueAtTime(700,audioCtx.currentTime); break;
+    case "ding": osc.type='sine'; osc.frequency.setValueAtTime(1400,audioCtx.currentTime); break;
+    case "twang": osc.type='sawtooth'; osc.frequency.setValueAtTime(1500,audioCtx.currentTime); break;
+  }
+
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.2);
+  osc.start(audioCtx.currentTime);
+  osc.stop(audioCtx.currentTime + 0.2);
+}
+
+// --- Angle difference helper ---
+function angleDiff(a,b){
+  let diff = a-b;
+  while(diff>180) diff-=360;
+  while(diff<-180) diff+=360;
+  return diff;
+}
+
+// Initialize FaceMesh
+const faceMesh = new FaceMesh({
+  locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+});
+faceMesh.setOptions({
+  maxNumFaces:1,
+  refineLandmarks:true,
+  minDetectionConfidence:0.5,
+  minTrackingConfidence:0.5
+});
+
+// --- Check posture ---
+function checkPosture(deviationRoll, avgPitch){
+  const now = Date.now();
+  const bad = (baselineRoll !== null && Math.abs(deviationRoll) > rollThreshold) ||
+              (baselinePitch !== null && Math.abs(avgPitch) > pitchThreshold);
+
+  if(bad){
+    if(!badPostureStart) badPostureStart = now;
+    else if(now - badPostureStart > badPostureDelay){
+      if(audioCtx.state==='suspended') audioCtx.resume();
+      playSound(soundSelect.value);
+      alertText.textContent = "⚠️ Fix your posture!";
+      alertOverlay.style.display = "block";
+    }
+  } else {
+    badPostureStart = null;
+    alertText.textContent = "";
+    alertOverlay.style.display = "none";
+  }
+}
+
+// --- Process each frame ---
+faceMesh.onResults(results=>{
+  ctx.save();
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.drawImage(video,0,0,canvas.width,canvas.height);
+
+  if(results.multiFaceLandmarks && results.multiFaceLandmarks.length>0){
+    const landmarks = results.multiFaceLandmarks[0];
+    const leftEar = landmarks[234];
+    const rightEar = landmarks[454];
+    const nose = landmarks[1];
+
+    const dxRoll = (rightEar.x-leftEar.x)*canvas.width;
+    const dyRoll = (rightEar.y-leftEar.y)*canvas.height;
+    let roll = Math.atan2(dyRoll, dxRoll)*(180/Math.PI);
+
+    const midX = (leftEar.x+rightEar.x)/2;
+    const midY = (leftEar.y+rightEar.y)/2;
+    const midZ = (leftEar.z+rightEar.z)/2;
+    const vecY = nose.y - midY;
+    const vecZ = nose.z - midZ;
+    let pitch = Math.atan2(-vecY, vecZ)*(180/Math.PI);
+
+    const deviationRoll = baselineRoll!==null ? angleDiff(roll, baselineRoll) : 0;
+    const deviationPitch = baselinePitch!==null ? angleDiff(pitch, baselinePitch) : 0;
+
+    if(baselinePitch!==null){
+      pitchBuffer.push(deviationPitch);
+      if(pitchBuffer.length>bufferSize) pitchBuffer.shift();
+    }
+    const avgPitch = pitchBuffer.length>0 ? pitchBuffer.reduce((a,b)=>a+b,0)/pitchBuffer.length : deviationPitch;
+
+    rollDisplay.textContent = baselineRoll!==null ? deviationRoll.toFixed(1) : roll.toFixed(1);
+    pitchDisplay.textContent = baselinePitch!==null ? avgPitch.toFixed(1) : pitch.toFixed(1);
+
+    ctx.fillStyle='red';
+    [leftEar,rightEar,nose].forEach(pt=>{
+      ctx.beginPath();
+      ctx.arc(pt.x*canvas.width, pt.y*canvas.height,4,0,2*Math.PI);
+      ctx.fill();
+    });
+
+    checkPosture(deviationRoll, avgPitch);
+
+  } else {
+    alertText.textContent = "";
+    alertOverlay.style.display = "none";
+  }
+  ctx.restore();
+});
+
+// --- Start camera ---
+const camera = new Camera(video,{
+  onFrame: async()=>{ await faceMesh.send({image:video}); },
+  width:320,height:240
+});
+camera.start();
+
+// --- Buttons ---
+document.getElementById('calibrate').onclick = ()=>{
+  baselineRoll = parseFloat(rollDisplay.textContent);
+  baselinePitch = parseFloat(pitchDisplay.textContent);
+  pitchBuffer.length=0;
+};
+document.getElementById('reset').onclick = ()=>{
+  baselineRoll = null;
+  baselinePitch = null;
+  rollDisplay.textContent='—';
+  pitchDisplay.textContent='—';
+  pitchBuffer.length=0;
+  alertText.textContent='';
+  alertOverlay.style.display='none';
+};
+</script>
+
+</body>
+</html>
